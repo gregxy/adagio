@@ -1,81 +1,105 @@
 use std::sync::Arc;
-use tokio::time::sleep;
+use std::time::Duration;
+use tokio::select;
+use tokio::time::{sleep, Instant};
+use tokio_util::sync::CancellationToken;
 
 use crate::inner::{BargeCore, Role};
 use crate::messaging::{
     AppendEntriesRequest, AppendEntriesResponse, RequestVoteRequest, RequestVoteResponse,
 };
 
-pub(crate) async fn wait_for_heartbeat(abc: Arc<BargeCore>, tick: u64) {
-    sleep(abc.config.pick_heartbeat_timeout()).await;
+static EPSILON: Duration = Duration::from_micros(2);
 
-    let mut trigger_election: bool = false;
-    let mut expecting_tick: u64 = 0;
+// TODO: single mode
+pub(crate) async fn run(abc: Arc<BargeCore>, ct: CancellationToken) {
+    let mut sleeptime = abc.config.pick_heartbeat_timeout();
     {
         let mut state = abc.state.lock();
-
-        if state.tick != tick || state.role != Role::Follower {
-            return;
-        }
-
-        state.tick += 1;
-        state.role = Role::Candidate;
-        state.term += 1;
-        state.vote_count = 0;
-        expecting_tick = state.tick;
-        trigger_election = true;
+        state.deadline = Instant::now() + sleeptime - EPSILON;
     }
 
-    if !trigger_election {
+    loop {
+        select! {
+            _ = ct.cancelled() => return,
+            _ = sleep(sleeptime) => sleeptime = act(abc.clone()),
+        }
+    }
+}
+
+fn act(abc: Arc<BargeCore>) -> Duration {
+    let mut to_trigger_election = false;
+    let mut to_send_heartbeat = false;
+    let term: u64;
+    let sleeptime: Duration;
+
+    {
+        let mut state = abc.state.lock();
+        let now = Instant::now();
+        if now < state.deadline {
+            return state.deadline - now + EPSILON;
+        }
+
+        // exceeded deadline
+        match state.role {
+            Role::Follower | Role::Candidate => {
+                to_trigger_election = true;
+
+                state.role = Role::Candidate;
+                state.term += 1;
+                state.vote_count = 0;
+
+                term = state.term;
+                sleeptime = abc.config.pick_election_timeout();
+                state.deadline = Instant::now() + sleeptime - EPSILON;
+            }
+            Role::Leader => {
+                to_send_heartbeat = true;
+
+                term = state.term;
+                sleeptime = abc.config.send_heartbeat_period;
+                state.deadline = Instant::now() + sleeptime - EPSILON;
+            }
+        }
+    }
+
+    if to_trigger_election {
+        trigger_election(abc.clone(), term);
+    }
+
+    if to_send_heartbeat {
+        send_heartbeat(abc, term);
+    }
+
+    sleeptime
+}
+
+fn trigger_election(abc: Arc<BargeCore>, term: u64) {
+    for idx in 0..abc.peers.len() {
+        tokio::spawn(request_vote(abc.clone(), term, idx));
+    }
+}
+
+async fn request_vote(abc: Arc<BargeCore>, term: u64, index: usize) {
+    let request = RequestVoteRequest {
+        term,
+        candidate_id: abc.id.clone(),
+    };
+
+    let result = abc.peers[index].request_vote(request).await;
+
+    // TODO: handle error and retry
+    if result.is_err() {
         return;
     }
 
-    tokio::spawn(wait_for_election(abc.clone(), tick + 1));
-
-    // TODO: send vote requests
+    let response = result.unwrap();
+    receive_request_vote_response(abc, response);
 }
 
-async fn wait_for_election(abc: Arc<BargeCore>, tick: u64) {
-    let mut expect_tick: u64 = tick;
-
-    loop {
-        sleep(abc.config.pick_election_timeout()).await;
-
-        let mut trigger_election_again: bool = false;
-        {
-            let mut state = abc.state.lock();
-
-            if state.tick != expect_tick || state.role != Role::Candidate {
-                return;
-            }
-
-            state.tick += 1;
-            expect_tick += 1;
-            state.vote_count = 0;
-            trigger_election_again = true;
-        }
-
-        if !trigger_election_again {
-            return;
-        }
-
-        // TODO: send vote requests
-    }
-}
-
-#[derive(PartialEq)]
-enum ElectionResult {
-    Unknown,
-    Win,
-    Loose,
-}
-
-pub(crate) async fn receive_request_vote_response(
-    abc: Arc<BargeCore>,
-    response: RequestVoteResponse,
-) {
-    let mut result = ElectionResult::Unknown;
-    let mut expecting_tick: u64 = 0;
+fn receive_request_vote_response(abc: Arc<BargeCore>, response: RequestVoteResponse) {
+    let mut won = false;
+    let mut term = 0;
 
     {
         let mut state = abc.state.lock();
@@ -87,23 +111,60 @@ pub(crate) async fn receive_request_vote_response(
         if response.granted {
             state.vote_count += 1;
             if state.vote_count >= state.vote_threshold {
-                result = ElectionResult::Win;
+                won = true;
+                term = state.term;
+                state.role = Role::Leader;
+                state.deadline = Instant::now() + abc.config.send_heartbeat_period;
             }
-        } else {
-            if response.term > state.term {
-                result = ElectionResult::Loose;
-                state.role = Role::Candidate;
-                state.term = response.term;
-                state.tick += 1;
-                expecting_tick = state.tick;
-            }
+        } else if response.term > state.term {
+            state.role = Role::Follower;
+            state.term = response.term;
+            state.deadline = Instant::now() + abc.config.pick_heartbeat_timeout();
         }
     }
 
-    if result == ElectionResult::Loose {
-        tokio::spawn(wait_for_election(abc.clone(), expecting_tick));
+    if won {
+        send_heartbeat(abc, term);
     }
-    // TODO: send heartbeat if won
+}
+
+fn send_heartbeat(abc: Arc<BargeCore>, term: u64) {
+    for idx in 0..abc.peers.len() {
+        tokio::spawn(send_heartbeat_request(abc.clone(), term, idx));
+    }
+}
+
+async fn send_heartbeat_request(abc: Arc<BargeCore>, term: u64, index: usize) {
+    let request = AppendEntriesRequest {
+        term,
+        leader_id: abc.id.clone(),
+    };
+
+    let result = abc.peers[index].append_entries(request).await;
+
+    if result.is_err() {
+        return;
+    }
+
+    let response = result.unwrap();
+
+    recieve_append_entries_response(abc, response);
+}
+
+fn recieve_append_entries_response(abc: Arc<BargeCore>, response: AppendEntriesResponse) {
+    {
+        let mut state = abc.state.lock();
+
+        if state.role != Role::Leader {
+            return;
+        }
+
+        if !response.success && response.term >= state.term {
+            state.role = Role::Follower;
+            state.term = response.term;
+            state.deadline = Instant::now() + abc.config.pick_heartbeat_timeout();
+        }
+    }
 }
 
 pub(crate) async fn receive_request_vote_request(
@@ -111,26 +172,20 @@ pub(crate) async fn receive_request_vote_request(
     request: RequestVoteRequest,
 ) -> RequestVoteResponse {
     let mut response = RequestVoteResponse::default();
-    let mut expecting_tick: u64 = 0;
     {
         let mut state = abc.state.lock();
         if request.term > state.term {
             response.granted = true;
             state.role = Role::Follower;
             state.term = request.term;
-            state.tick += 1;
-            expecting_tick = state.tick;
+            state.deadline = Instant::now() + abc.config.pick_election_timeout();
         } else {
             response.granted = false;
             response.term = state.term;
         }
     }
 
-    if response.granted {
-        tokio::spawn(wait_for_election(abc.clone(), expecting_tick));
-    }
-
-    return response;
+    response
 }
 
 pub(crate) async fn recieve_append_entries_request(
@@ -138,9 +193,6 @@ pub(crate) async fn recieve_append_entries_request(
     request: AppendEntriesRequest,
 ) -> AppendEntriesResponse {
     let mut response = AppendEntriesResponse::default();
-    let mut expecting_tick: u64 = 0;
-    let mut trigger_election = false;
-    let mut need_heartbeat = false;
     {
         let mut state = abc.state.lock();
 
@@ -152,59 +204,12 @@ pub(crate) async fn recieve_append_entries_request(
         }
 
         if request.term == state.term && state.role == Role::Leader {
-            response.term = state.term;
-            response.success = false;
-
-            state.role = Role::Candidate;
-            state.term += 1;
-            state.tick += 1;
-            state.vote_count = 0;
-            expecting_tick = state.tick;
-            trigger_election = true;
+            state.role = Role::Follower;
+            state.deadline = Instant::now() + abc.config.pick_election_timeout();
         } else {
-            state.term = request.term;
-            state.tick += 1;
-            expecting_tick = state.tick;
-            need_heartbeat = true;
+            state.deadline = Instant::now() + abc.config.pick_heartbeat_timeout();
         }
     }
 
-    if trigger_election {
-        // TODO: Send vote request;
-        tokio::spawn(wait_for_election(abc.clone(), expecting_tick));
-    } else if need_heartbeat {
-        tokio::spawn(wait_for_heartbeat(abc.clone(), expecting_tick));
-    }
-
-    return response;
-}
-
-pub(crate) async fn recieve_append_entries_response(
-    abc: Arc<BargeCore>,
-    response: AppendEntriesResponse,
-) {
-    let mut expecting_tick: u64 = 0;
-    let mut need_heartbeat = false;
-
-    {
-        let mut state = abc.state.lock();
-
-        if state.role != Role::Leader {
-            return;
-        }
-
-        if response.success == false {
-            if response.term > state.term {
-                state.role = Role::Follower;
-                state.tick += 1;
-                expecting_tick = state.tick;
-                state.term = response.term;
-                need_heartbeat = true;
-            }
-        }
-    }
-
-    if need_heartbeat {
-        tokio::spawn(wait_for_heartbeat(abc.clone(), expecting_tick));
-    }
+    response
 }
