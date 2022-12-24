@@ -137,6 +137,7 @@ mod config_tests {
             heartbeat_timeout_max: Duration::from_millis(500),
             election_timeout_min: Duration::from_millis(420),
             election_timeout_max: Duration::from_millis(460),
+            peer_uris: Vec::new(),
         }
     }
 
