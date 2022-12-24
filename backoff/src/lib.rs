@@ -24,22 +24,16 @@ impl Default for Config {
     }
 }
 
-pub struct Backoff {
-    config: Config,
+pub struct Backoff<'a> {
+    config: &'a Config,
     jitter_range: Uniform<f32>,
     rng: ThreadRng,
     without_jitter: Duration,
     with_jitter: Duration,
 }
 
-impl Default for Backoff {
-    fn default() -> Self {
-        Self::new(Config::default())
-    }
-}
-
-impl Backoff {
-    pub fn new(config: Config) -> Self {
+impl<'a> Backoff<'a> {
+    pub fn new(config: &'a Config) -> Self {
         Self {
             jitter_range: Uniform::new_inclusive(1.0 - config.jitter, 1.0 + config.jitter),
             rng: ThreadRng::default(),
